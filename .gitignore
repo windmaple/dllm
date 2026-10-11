@@ -2,5 +2,7 @@ __pycache__/
 *.pyc
 data/*.bin
 data/*.npy
-out/*.pt
-out/train.log
+out*/*.pt
+out*/train.log
+data_full/
+wandb/

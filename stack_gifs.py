@@ -1,6 +1,7 @@
 """Stack several diffusion GIFs vertically into one, with a labelled banner per panel.
 
     python stack_gifs.py   # uses the three GIFs in assets/ -> assets/diffusion_stacked.gif
+    python stack_gifs.py --prompt "Once upon a time" --model miniGPT --data TinyStories   # TinyStories labels
 """
 
 import argparse
@@ -9,14 +10,15 @@ from PIL import Image, ImageDraw
 
 from visualize import BG, FG, MASK_FILL, NEW_BG, PROMPT_FG, EOS_OUTLINE, load_font
 
-DEFAULT_PANELS = [
-    ("assets/diffusion_prompt.gif", "A", "Prompted  (\"Once upon a time\")",
-     "random-order unmasking  ·  MDLM ancestral sampler", (230, 120, 30)),
-    ("assets/diffusion_uncond.gif", "B", "Unconditional  (no prompt)",
-     "random-order unmasking  ·  MDLM ancestral sampler", (40, 150, 90)),
-    ("assets/diffusion_block_confidence.gif", "C", "Prompted  (\"Once upon a time\")",
-     "confidence-based unmasking  ·  semi-autoregressive blocks of 32 (LLaDA)", (120, 70, 200)),
-]
+def make_panels(prefix, prompt):
+    return [
+        (f"{prefix}_prompt.gif", "A", f"Prompted  (\"{prompt}\")",
+         "random-order unmasking  ·  MDLM ancestral sampler", (230, 120, 30)),
+        (f"{prefix}_uncond.gif", "B", "Unconditional  (no prompt)",
+         "random-order unmasking  ·  MDLM ancestral sampler", (40, 150, 90)),
+        (f"{prefix}_block_confidence.gif", "C", f"Prompted  (\"{prompt}\")",
+         "confidence-based unmasking  ·  semi-autoregressive blocks of 32 (LLaDA)", (120, 70, 200)),
+    ]
 CROP_TOP = 46        # drop each panel's own big title line (keep its step/progress line)
 BANNER_H = 44
 HEADER_H = 92
@@ -31,20 +33,29 @@ def gif_frames(path):
         yield im.convert("RGB"), im.info.get("duration", 50)
 
 
+def fit_font(text, size, max_w, bold=False):
+    """Largest font <= size at which text fits in max_w pixels."""
+    while size > 10 and load_font(size, bold).getlength(text) > max_w:
+        size -= 1
+    return load_font(size, bold)
+
+
 def draw_banner(d, y, w, letter, title, desc, color):
     d.rectangle([0, y, w, y + BANNER_H], fill=(238, 238, 234))
     d.rectangle([0, y, 10, y + BANNER_H], fill=color)
     # letter badge
     d.rounded_rectangle([26, y + 8, 54, y + 36], radius=6, fill=color)
-    f_badge, f_title, f_desc = load_font(20, bold=True), load_font(19, bold=True), load_font(16)
+    f_badge, f_title = load_font(20, bold=True), load_font(19, bold=True)
+    x_desc = 68 + f_title.getlength(title) + 18
+    f_desc = fit_font(desc, 16, w - x_desc - 16)
     d.text((40, y + 22), letter, font=f_badge, fill=(255, 255, 255), anchor="mm")
     d.text((68, y + 11), title, font=f_title, fill=FG)
-    d.text((68 + f_title.getlength(title) + 18, y + 14), desc, font=f_desc, fill=(90, 90, 90))
+    d.text((x_desc, y + 22), desc, font=f_desc, fill=(90, 90, 90), anchor="lm")
 
 
-def draw_header(d, w):
-    d.text((24, 16), "Text diffusion with miniGPT (trained on TinyStories): 3 sampling settings",
-           font=load_font(24, bold=True), fill=FG)
+def draw_header(d, w, model, data):
+    title = f"Text diffusion with {model} (trained on {data}): 3 sampling settings"
+    d.text((24, 16), title, font=fit_font(title, 24, w - 48, bold=True), fill=FG)
     # legend
     f = load_font(15)
     x, y = 24, 58
@@ -69,12 +80,16 @@ def draw_header(d, w):
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--prefix", default="assets/diffusion", help="panels: <prefix>_{prompt,uncond,block_confidence}.gif")
+    ap.add_argument("--prompt", default="In a shocking finding, scientists")
+    ap.add_argument("--model", default="GPT-2 (124M)")
+    ap.add_argument("--data", default="OpenWebText")
     ap.add_argument("--out", default="assets/diffusion_stacked.gif")
     ap.add_argument("--frame_ms", type=int, default=50)
     ap.add_argument("--hold_ms", type=int, default=4000)
     args = ap.parse_args()
 
-    panels = DEFAULT_PANELS
+    panels = make_panels(args.prefix, args.prompt)
     sizes, counts = [], []
     for p in panels:
         im = Image.open(p[0])
@@ -88,7 +103,7 @@ def main():
     # static background: header + banners
     base = Image.new("RGB", (W, H), BG)
     d = ImageDraw.Draw(base)
-    draw_header(d, W)
+    draw_header(d, W, args.model, args.data)
     ys, y = [], HEADER_H
     for (_, letter, title, desc, color), h in zip(panels, heights):
         draw_banner(d, y, W, letter, title, desc, color)

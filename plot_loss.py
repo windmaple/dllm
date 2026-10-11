@@ -16,6 +16,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--log", default="out/log.jsonl")
     ap.add_argument("--out", default="assets/loss.png")
+    ap.add_argument("--title", default="GPT-2 (124M) masked diffusion on OpenWebText")
     args = ap.parse_args()
 
     rows = [json.loads(line) for line in open(args.log)]
@@ -28,10 +29,10 @@ def main():
     ax.plot([r["iter"] for r in va], [r["val_ce"] for r in va], "s--", label="val masked-token CE")
     ax.set_xlabel("iteration")
     ax.set_ylabel("loss")
-    ax.set_ylim(top=min(6, ax.get_ylim()[1]))
+    ax.set_ylim(top=min(ax.get_ylim()[1], 1.25 * max(r["val_elbo"] for r in va)))  # clip the init spike
     ax.grid(alpha=0.3)
     ax.legend()
-    ax.set_title("miniGPT masked diffusion on TinyStories")
+    ax.set_title(args.title)
     fig.tight_layout()
     fig.savefig(args.out, dpi=120)
     print(f"saved {args.out}")

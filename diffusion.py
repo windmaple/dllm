@@ -17,17 +17,29 @@ import math
 import torch
 import torch.nn.functional as F
 
-from data import EOS_ID, MASK_ID, UNK_ID
+from data import MASK_ID, UNK_ID
 
 
-def diffusion_loss(model, x0, eps=1e-3):
-    """x0: (B, L) clean tokens. Returns (elbo_loss, masked_token_ce)."""
+def diffusion_loss(model, x0, eps=1e-3, static_shapes=False, mask_id=MASK_ID):
+    """x0: (B, L) clean tokens. Returns (elbo_loss, masked_token_ce).
+
+    static_shapes: compute logits at every position and zero out the unmasked ones instead of
+      gathering the masked positions. Same loss, but no data-dependent tensor shapes, which on
+      TPU/XLA would trigger a recompilation every step.
+    """
     B, L = x0.shape
     # Stratified sampling of t over the batch -> lower-variance loss estimate.
     u = (torch.rand(1, device=x0.device) + torch.arange(B, device=x0.device) / B) % 1.0
     t = eps + (1 - eps) * u  # (B,)
     is_masked = torch.rand(B, L, device=x0.device) < t[:, None]
-    xt = torch.where(is_masked, MASK_ID, x0)
+    xt = torch.where(is_masked, mask_id, x0)
+
+    if static_shapes:
+        logits = model(xt)  # (B, L, V)
+        ce = F.cross_entropy(logits.float().flatten(0, 1), x0.flatten(), reduction="none").view(B, L)
+        ce = torch.where(is_masked, ce, 0.0)
+        elbo = (ce / t[:, None]).sum() / (B * L)
+        return elbo, ce.sum() / is_masked.sum().clamp(min=1)
 
     logits = model(xt, only=is_masked)  # (N_masked, V)
     ce = F.cross_entropy(logits.float(), x0[is_masked], reduction="none")
@@ -46,8 +58,9 @@ def _num_to_unmask(n_masked, steps):
 
 @torch.no_grad()
 def generate(model, prompt_ids=None, length=256, steps=128, temperature=1.0, top_k=None,
-             strategy="confidence", block_len=None, record=True, device="cpu", generator=None):
-    """Sample one sequence by iterative unmasking.
+             strategy="confidence", block_len=None, record=True, device="cpu", generator=None,
+             mask_id=MASK_ID, banned_ids=(MASK_ID, UNK_ID), num_samples=1):
+    """Sample sequences by iterative unmasking.
 
     strategy:
       "confidence": at each step reveal the masked positions whose sampled token
@@ -59,39 +72,44 @@ def generate(model, prompt_ids=None, length=256, steps=128, temperature=1.0, top
       within each block (the model still attends to the whole sequence). This stops
       confidence-based sampling from committing far-away, easy tokens (e.g. trailing
       <eos> padding) too early.
-    Returns (final_tokens, history) where history is a list of (tokens, newly_revealed_mask)
-    tensors, one per step (step 0 = initial state).
+    num_samples: denoise this many independent sequences (same prompt) as one batch.
+    Returns (final_tokens, history): final_tokens is (length,) for num_samples=1, else
+    (num_samples, length); history is a list of (tokens, newly_revealed_mask) tensors of the
+    first sequence, one per step (step 0 = initial state).
     """
     model.eval()
-    x = torch.full((1, length), MASK_ID, dtype=torch.long, device=device)
+    B = num_samples
+    x = torch.full((B, length), mask_id, dtype=torch.long, device=device)
     if prompt_ids:
         p = torch.tensor(prompt_ids[:length], device=device)
-        x[0, : len(p)] = p
+        x[:, : len(p)] = p
     history = [(x[0].clone().cpu(), torch.zeros(length, dtype=torch.bool))] if record else []
 
-    # Partition the masked positions into blocks and give each block a share of the steps.
-    masked_pos = (x[0] == MASK_ID).nonzero()[:, 0]
+    # Partition the masked positions (the same in every row) into blocks; each gets a share of the steps.
+    masked_pos = (x[0] == mask_id).nonzero()[:, 0]
     if block_len is None:
         blocks = [masked_pos]
     else:
         blocks = [b for b in torch.split(masked_pos, block_len) if len(b)]
     steps_per_block = max(1, steps // len(blocks))
 
+    ban = None  # additive -inf bias: never predict <mask> / special / padding ids
     for blk in blocks:
         in_block = torch.zeros(1, length, dtype=torch.bool, device=device)
         in_block[0, blk] = True
         n_steps = min(steps_per_block, len(blk))
         for k in _num_to_unmask(len(blk), n_steps).tolist():
-            logits = model(x).float()  # (1, L, V)
-            logits[..., MASK_ID] = -math.inf  # never predict the special tokens
-            logits[..., UNK_ID] = -math.inf
-            logits = logits / max(temperature, 1e-5)
+            logits = model(x).float()  # (B, L, V)
+            if ban is None:
+                ban = torch.zeros(logits.shape[-1], device=device)
+                ban[list(banned_ids)] = -math.inf
+            logits = (logits + ban) / max(temperature, 1e-5)
             if top_k is not None:
                 kth = torch.topk(logits, top_k, dim=-1).values[..., -1:]
                 logits = logits.masked_fill(logits < kth, -math.inf)
             probs = logits.softmax(-1)
             if temperature > 0:
-                x0 = torch.multinomial(probs[0], 1, generator=generator).T  # (1, L)
+                x0 = torch.multinomial(probs.flatten(0, 1), 1, generator=generator).view(B, length)
             else:
                 x0 = probs.argmax(-1)
             conf = probs.gather(-1, x0[..., None])[..., 0]  # p(chosen token)
@@ -102,12 +120,10 @@ def generate(model, prompt_ids=None, length=256, steps=128, temperature=1.0, top
                 score = torch.rand(conf.shape, device=device, generator=generator)
             else:
                 raise ValueError(strategy)
-            eligible = (x == MASK_ID) & in_block
+            eligible = (x == mask_id) & in_block
             score = score.masked_fill(~eligible, -math.inf)
-            idx = torch.topk(score[0], k).indices
-            reveal = torch.zeros_like(eligible)
-            reveal[0, idx] = True
+            reveal = torch.zeros_like(eligible).scatter_(1, torch.topk(score, k, dim=-1).indices, True)
             x = torch.where(reveal, x0, x)
             if record:
                 history.append((x[0].clone().cpu(), reveal[0].clone().cpu()))
-    return x[0].cpu(), history
+    return (x[0] if B == 1 else x).cpu(), history

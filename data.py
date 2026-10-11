@@ -45,6 +45,10 @@ class CompactTokenizer:
         out = self.enc.encode_ordinary_batch(texts, num_threads=num_threads)
         return [self.from_gpt2[ids] for ids in out]
 
+    def token_bytes(self, i):
+        """Raw bytes of a non-special compact token id."""
+        return self.enc.decode_single_token_bytes(int(self.to_gpt2[i]))
+
     def token_str(self, i):
         """Human-readable string of a single compact token id."""
         if i == EOS_ID:

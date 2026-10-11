@@ -3,17 +3,21 @@
     python visualize.py --out assets/diffusion_uncond.gif
     python visualize.py --prompt "Once upon a time, there was a little dog" --out assets/diffusion_prompt.gif
     python visualize.py --strategy random --out assets/diffusion_random.gif
+    python visualize.py --ckpt out_owt/ckpt.pt --prompt "In a shocking finding, scientists" \
+        --out assets/owt_prompt.gif      # GPT-2 / OpenWebText checkpoint (dataset read from the checkpoint)
 """
 
 import argparse
+import codecs
 import os
 
 import torch
 from PIL import Image, ImageDraw, ImageFont
 
-from data import EOS_ID, MASK_ID, CompactTokenizer
+from data import EOS_ID, MASK_ID
 from diffusion import generate
-from model import MiniGPT, MiniGPTConfig
+from sample import load_checkpoint
+from train import setup_device
 
 # ---- style -----------------------------------------------------------------
 W = 1100
@@ -71,28 +75,37 @@ def layout(pieces, font, line_h, width):
     return placed, y + line_h
 
 
-def frame_pieces(tok, tokens, new_mask, n_prompt):
-    """Turn one diffusion state into (text, kind) pieces for drawing."""
+def frame_pieces(tok, tokens, new_mask, n_prompt, mask_id, eos_id):
+    """Turn one diffusion state into (text, kind) pieces for drawing.
+
+    Tokens are byte-level BPE, so one character (e.g. a curly quote) can span several tokens: decode
+    runs of adjacent tokens incrementally so it is drawn once complete instead of as replacement chars.
+    """
     pieces = []
+    dec = codecs.getincrementaldecoder("utf-8")(errors="replace")
     for i, (t, new) in enumerate(zip(tokens.tolist(), new_mask.tolist())):
-        if t == MASK_ID:
-            pieces.append(("", "mask"))
-        elif t == EOS_ID:
-            pieces.append(("", "eos_new" if new else "eos"))
+        if t == mask_id or t == eos_id:
+            if tail := dec.decode(b"", final=True):
+                pieces.append((tail, "old"))
+            dec.reset()
+            pieces.append(("", "mask") if t == mask_id else ("", "eos_new" if new else "eos"))
         else:
             kind = "prompt" if i < n_prompt else ("new" if new else "old")
-            pieces.append((tok.token_str(t), kind))
+            if text := dec.decode(tok.token_bytes(t)):
+                pieces.append((text, kind))
+    if tail := dec.decode(b"", final=True):
+        pieces.append((tail, "old"))
     return pieces
 
 
-def render(history, tok, n_prompt, title, subtitle):
+def render(history, tok, n_prompt, title, subtitle, mask_id=MASK_ID, eos_id=EOS_ID):
     font = load_font(18)
     font_title = load_font(24, bold=True)
     font_small = load_font(15)
     line_h = 28
     text_w = W - 2 * MARGIN
 
-    layouts = [layout(frame_pieces(tok, tokens, new, n_prompt), font, line_h, text_w)
+    layouts = [layout(frame_pieces(tok, tokens, new, n_prompt, mask_id, eos_id), font, line_h, text_w)
                for tokens, new in history]
     H = HEADER_H + max(h for _, h in layouts) + MARGIN
 
@@ -104,7 +117,7 @@ def render(history, tok, n_prompt, title, subtitle):
         img = Image.new("RGB", (W, H), BG)
         d = ImageDraw.Draw(img)
         d.text((MARGIN, 18), title, font=font_title, fill=FG)
-        n_masked = int((tokens == MASK_ID).sum())
+        n_masked = int((tokens == mask_id).sum())
         d.text((MARGIN, 52), f"{subtitle}   |   step {s:3d}/{n_steps}   |   masked {n_masked:3d}/{L}",
                font=font_small, fill=(110, 110, 110))
         # progress bar
@@ -134,7 +147,7 @@ def render(history, tok, n_prompt, title, subtitle):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", default="out/ckpt.pt")
-    ap.add_argument("--data_dir", default="data")
+    ap.add_argument("--data_dir", default="data", help="TinyStories vocab.json location")
     ap.add_argument("--prompt", default="")
     ap.add_argument("--length", type=int, default=256)
     ap.add_argument("--steps", type=int, default=256)
@@ -146,22 +159,24 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--frame_ms", type=int, default=50)
     ap.add_argument("--out", default="assets/diffusion.gif")
+    ap.add_argument("--device", default="auto", choices=["auto", "tpu", "cpu"])
+    ap.add_argument("--dtype", default="float32", choices=["float32", "bfloat16"])
     args = ap.parse_args()
+    device = setup_device(args.device)
 
     torch.manual_seed(args.seed)
-    tok = CompactTokenizer(os.path.join(args.data_dir, "vocab.json"))
-    ck = torch.load(args.ckpt, map_location="cpu")
-    model = MiniGPT(MiniGPTConfig(**ck["config"]))
-    model.load_state_dict(ck["model"])
-    model.eval()
+    model, tok, ids_kw, eos_id, dataset = load_checkpoint(args.ckpt, args.data_dir, device)
+    mask_id = ids_kw["mask_id"]
+    title = ("Text diffusion with GPT-2 (124M)  (trained on OpenWebText)" if dataset == "owt"
+             else "Text diffusion with miniGPT  (trained on TinyStories)")
 
     prompt_ids = tok.encode(args.prompt) if args.prompt else None
-    final, history = generate(model, prompt_ids, length=args.length, steps=args.steps,
-                              temperature=args.temperature, top_k=args.top_k, strategy=args.strategy,
-                              block_len=args.block_len)
+    with torch.autocast(device.type, dtype=torch.bfloat16, enabled=args.dtype == "bfloat16"):
+        final, history = generate(model, prompt_ids, length=args.length, steps=args.steps,
+                                  temperature=args.temperature, top_k=args.top_k, strategy=args.strategy,
+                                  block_len=args.block_len, device=device, **ids_kw)
     print(tok.decode(final))
 
-    title = "Text diffusion with miniGPT  (trained on TinyStories)"
     subtitle = f"{args.strategy} unmasking"
     if args.block_len:
         subtitle += f", blocks of {args.block_len}"
@@ -170,7 +185,7 @@ def main():
         subtitle += ", prompt in blue"
     # append a final clean frame (no highlights) that is held at the end
     history = history + [(final, torch.zeros_like(final, dtype=torch.bool))]
-    frames = render(history, tok, len(prompt_ids or []), title, subtitle)
+    frames = render(history, tok, len(prompt_ids or []), title, subtitle, mask_id, eos_id)
     durations = [600] + [args.frame_ms] * (len(frames) - 2) + [3500]
 
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)

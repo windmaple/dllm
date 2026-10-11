@@ -98,6 +98,13 @@ class MiniGPT(nn.Module):
             if name.endswith("c_proj.weight"):
                 nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * cfg.n_layer))
 
+    def _apply(self, fn, *args, **kwargs):
+        # Some backends (e.g. TPU) replace the Parameter objects on .to(device), which unties
+        # lm_head from wte -> re-tie after every device / dtype conversion.
+        super()._apply(fn, *args, **kwargs)
+        self.lm_head.weight = self.wte.weight
+        return self
+
     @staticmethod
     def _init_weights(m):
         if isinstance(m, nn.Linear):
